@@ -1691,8 +1691,54 @@ async def test_403_step_up_preserves_scope_from_stored_token(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(
+    "endpoint_suffix",
+    [
+        "#fragment",
+        "#",
+        "?response_type=token",
+        "?client_id=other",
+        "?redirect_uri=https://other.example",
+        "?%73cope=",
+        "?state",
+        "?code_challenge=other",
+        "?code_challenge_method=plain",
+        "?resource=https://other.example",
+        "?prompt=none",
+    ],
+)
+async def test_authorization_endpoint_with_fragment_or_oauth_parameter_is_rejected(
+    oauth_provider: OAuthClientProvider, endpoint_suffix: str
+) -> None:
+    """OAuth 2.1 forbids fragments. The SDK rejects preconfigured OAuth request parameters."""
+
+    async def unexpected_redirect(url: str) -> None:
+        raise NotImplementedError
+
+    oauth_provider.context.redirect_handler = unexpected_redirect
+    oauth_provider.context.client_info = OAuthClientInformationFull(client_id="registered-client")
+    oauth_provider.context.client_metadata.scope = None
+    oauth_provider.context.oauth_metadata = OAuthMetadata(
+        issuer=AnyHttpUrl("https://auth.example.com"),
+        authorization_endpoint=AnyHttpUrl(f"https://auth.example.com/authorize{endpoint_suffix}"),
+        token_endpoint=AnyHttpUrl("https://auth.example.com/token"),
+    )
+
+    with pytest.raises(OAuthFlowError):
+        await oauth_provider._perform_authorization_code_grant()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("endpoint_query", "redirect_prefix"),
+    [("", "authorize?response_type=code&"), ("?tenant=acme", "authorize?tenant=acme&response_type=code&")],
+)
 async def test_scope_step_up_discovers_the_authorization_server_before_reauthorizing(
-    oauth_provider: OAuthClientProvider, mock_storage: MockTokenStorage, valid_tokens: OAuthToken
+    oauth_provider: OAuthClientProvider,
+    mock_storage: MockTokenStorage,
+    valid_tokens: OAuthToken,
+    endpoint_query: str,
+    redirect_prefix: str,
 ):
     """SDK-defined: a 403 scope challenge runs discovery first when no metadata is held, so
     re-authorization targets the advertised server.
@@ -1702,7 +1748,7 @@ async def test_scope_step_up_discovers_the_authorization_server_before_reauthori
     2. The first response is 403 insufficient_scope -> the next requests are PRM (at the challenge's
        `resource_metadata` URL) then ASM discovery.
     3. The authorization redirect and the token request use the discovered server's endpoints, and
-       the requested scope is the SEP-2350 union.
+       the requested scope is the SEP-2350 union. OAuth 2.1 requires retaining any endpoint query.
     """
     await mock_storage.set_tokens(valid_tokens)
     await mock_storage.set_client_info(
@@ -1745,16 +1791,16 @@ async def test_scope_step_up_discovers_the_authorization_server_before_reauthori
     assert str(asm_request.url) == "https://auth.example.com/.well-known/oauth-authorization-server"
     asm_response = httpx2.Response(
         200,
-        content=(
-            b'{"issuer": "https://auth.example.com",'
-            b' "authorization_endpoint": "https://auth.example.com/authorize",'
-            b' "token_endpoint": "https://auth.example.com/token"}'
-        ),
+        json={
+            "issuer": "https://auth.example.com",
+            "authorization_endpoint": f"https://auth.example.com/authorize{endpoint_query}",
+            "token_endpoint": "https://auth.example.com/token",
+        },
         request=asm_request,
     )
 
     token_request = await auth_flow.asend(asm_response)
-    assert redirects[-1].startswith("https://auth.example.com/authorize?")
+    assert redirects[-1].startswith(f"https://auth.example.com/{redirect_prefix}")
     assert parse_qs(urlparse(redirects[-1]).query)["scope"] == ["read write admin"]
     assert token_request.method == "POST"
     assert str(token_request.url) == "https://auth.example.com/token"

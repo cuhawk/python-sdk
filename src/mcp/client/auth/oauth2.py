@@ -12,7 +12,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol, get_args
-from urllib.parse import quote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import anyio
 import httpx2
@@ -425,7 +425,19 @@ class OAuthClientProvider(RedirectAwareAuth):
             if "offline_access" in self.context.client_metadata.scope.split():
                 auth_params["prompt"] = "consent"
 
-        authorization_url = f"{auth_endpoint}?{urlencode(auth_params)}"
+        # OAuth 2.1 section 3.1 requires retaining the endpoint query and forbids fragments.
+        if "#" in auth_endpoint:
+            raise OAuthFlowError("Authorization endpoint URL must not contain a fragment")
+
+        endpoint = urlsplit(auth_endpoint)
+        endpoint_params = parse_qsl(endpoint.query, keep_blank_values=True)
+        reserved_params = auth_params.keys() | {"scope", "resource", "prompt"}
+        for name, _ in endpoint_params:
+            if name in reserved_params:
+                raise OAuthFlowError(f"Authorization endpoint URL contains OAuth request parameter: {name}")
+
+        query = urlencode([*endpoint_params, *auth_params.items()])
+        authorization_url = urlunsplit(endpoint._replace(query=query))
         with waiting_on_a_person():
             await self.context.redirect_handler(authorization_url)
             result = await self.context.callback_handler()
